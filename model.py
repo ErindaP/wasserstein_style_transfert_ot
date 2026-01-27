@@ -69,9 +69,10 @@ def stylize(level, content, style, encoders, decoders, alpha, device):
         return decoders[level](transformed_features)
 
 class MultiLevelStyleTransfer(nn.Module):
-    def __init__(self, alpha=0.5, device='cpu'):
+    def __init__(self, alpha=0.5, style_weights=None, device='cpu'):
         super().__init__()
         self.alpha = alpha
+        self.style_weights = style_weights
         self.device = device
         self.encoders = [Encoder(level).to(device) for level in range(5, 0, -1)]
         self.decoders = [Decoder(level).to(device) for level in range(5, 0, -1)]
@@ -96,9 +97,14 @@ class MultiLevelStyleTransfer(nn.Module):
             
             with torch.no_grad():
                 content_features = encoder(current_img).squeeze(0)
-                style_features = encoder(style_img).squeeze(0)
                 
-                transformed_features = gaussian_transfer(self.alpha, content_features, style_features).to(self.device)
+                # Handle single style or list of styles
+                if isinstance(style_img, list):
+                    style_features = [encoder(s).squeeze(0) for s in style_img]
+                else:
+                     style_features = encoder(style_img).squeeze(0)
+                
+                transformed_features = gaussian_transfer(self.alpha, content_features, style_features, style_weights=self.style_weights).to(self.device)
                 
                 current_img = decoder(transformed_features)
                 
