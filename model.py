@@ -5,7 +5,7 @@ from models.autoencoder_vgg19.vgg19_2 import vgg_normalised_conv2_1, feature_inv
 from models.autoencoder_vgg19.vgg19_3 import vgg_normalised_conv3_1, feature_invertor_conv3_1
 from models.autoencoder_vgg19.vgg19_4 import vgg_normalised_conv4_1, feature_invertor_conv4_1
 from models.autoencoder_vgg19.vgg19_5 import vgg_normalised_conv5_1, feature_invertor_conv5_1
-from wst import gaussian_transfer
+from wst import gaussian_transfer, gmm_transfer
 
 class Encoder(nn.Module):
     def __init__(self, depth):
@@ -69,10 +69,12 @@ def stylize(level, content, style, encoders, decoders, alpha, device):
         return decoders[level](transformed_features)
 
 class MultiLevelStyleTransfer(nn.Module):
-    def __init__(self, alpha=0.5, style_weights=None, device='cpu'):
+    def __init__(self, alpha=0.5, style_weights=None, method='gaussian', K=5, device='cpu'):
         super().__init__()
         self.alpha = alpha
         self.style_weights = style_weights
+        self.method = method
+        self.K = K
         self.device = device
         self.encoders = [Encoder(level).to(device) for level in range(5, 0, -1)]
         self.decoders = [Decoder(level).to(device) for level in range(5, 0, -1)]
@@ -104,7 +106,10 @@ class MultiLevelStyleTransfer(nn.Module):
                 else:
                      style_features = encoder(style_img).squeeze(0)
                 
-                transformed_features = gaussian_transfer(self.alpha, content_features, style_features, style_weights=self.style_weights).to(self.device)
+                if self.method == 'gmm':
+                    transformed_features = gmm_transfer(self.alpha, content_features, style_features, style_weights=self.style_weights, K=self.K).to(self.device)
+                else:
+                    transformed_features = gaussian_transfer(self.alpha, content_features, style_features, style_weights=self.style_weights).to(self.device)
                 
                 current_img = decoder(transformed_features)
                 

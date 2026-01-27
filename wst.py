@@ -1,4 +1,243 @@
 import torch
+import numpy as np
+import ot
+import ot.gmm
+import sklearn.mixture
+
+def gmm_transfer(alpha, cf, styles, style_weights=None, K=5):
+    """
+    Apply GMM-based Wasserstein Style Transfer.
+    
+    Args:
+        alpha: float
+        cf: content features tensor (C, H, W)
+        styles: list of style features tensors
+        style_weights: list of weights
+        K: number of GMM components
+    """
+    # 0. Setup
+    if isinstance(styles, torch.Tensor):
+        styles = [styles]
+        style_weights = [1.0]
+
+    if style_weights is None:
+        style_weights = [1.0/len(styles)] * len(styles)
+        
+    cf = cf.double()
+    channels = cf.size(0)
+    cfv = cf.view(channels, -1) # C x N
+    
+    # Subsampling for GMM fitting to improve speed
+    # Fitting on 262k points (512x512) is very slow. 
+    # We can estimate parameters from a subset.
+    MAX_SAMPLES = 25000
+    
+    def fit_gmm(features, n_components):
+        # features: (N, C) numpy
+        n_samples = features.shape[0]
+        if n_samples > MAX_SAMPLES:
+            rng = np.random.RandomState(42) # fixed seed
+            indices = rng.choice(n_samples, MAX_SAMPLES, replace=False)
+            features_subset = features[indices]
+        else:
+            features_subset = features
+            
+        gmm = sklearn.mixture.GaussianMixture(n_components=n_components, covariance_type='full', reg_covar=1e-5)
+        gmm.fit(features_subset)
+        return gmm
+
+    def ensure_pd(cov, eps=1e-5):
+        # Ensure covariance is positive definite
+        # cov: (K, C, C) or (C,C)
+        if cov.ndim == 2:
+            cov = (cov + cov.T) / 2
+            cov = cov + np.eye(cov.shape[0]) * eps
+        elif cov.ndim == 3:
+            for k in range(cov.shape[0]):
+                cov[k] = (cov[k] + cov[k].T) / 2
+                cov[k] = cov[k] + np.eye(cov.shape[1]) * eps
+        return cov
+
+    # 1. Fit GMM to Content
+    x_np_full = cfv.T.cpu().numpy()
+    c_gmm = fit_gmm(x_np_full, K)
+    
+    # 2. Fit/Construct GMM for Style (Barycenter)
+    s_weights_list = []
+    s_means_list = []
+    s_covs_list = []
+    
+    for i, sf in enumerate(styles):
+        sf = sf.double()
+        sfv = sf.view(channels, -1)
+        s_np_full = sfv.T.cpu().numpy()
+        
+        s_gmm = fit_gmm(s_np_full, K)
+        
+        s_weights_list.append(s_gmm.weights_ * style_weights[i])
+        s_means_list.append(s_gmm.means_)
+        s_covs_list.append(s_gmm.covariances_)
+        
+    # Combine parameters to form the Target GMM
+    ws = np.concatenate(s_weights_list)
+    ms = np.concatenate(s_means_list)
+    Cs = np.concatenate(s_covs_list)
+    
+    ws = ws / ws.sum()
+    
+    wc = c_gmm.weights_
+    mc = c_gmm.means_
+    Cc = c_gmm.covariances_
+    
+    Cs = ensure_pd(Cs)
+    Cc = ensure_pd(Cc)
+    
+    # 3. Compute OT Plan between GMM components
+    # Calculate Cost Matrix (Wasserstein distance between Gaussians)
+    import ot # Ensure ot is available
+    
+    # helper for W2 distance between two Gaussians
+    def gaussian_w2_dist(m1, C1, m2, C2):
+        # m: (D,), C: (D, D)
+        # W2^2 = ||m1-m2||^2 + Tr(C1 + C2 - 2(C1^1/2 C2 C1^1/2)^1/2)
+        diff = m1 - m2
+        term1 = torch.sum(diff**2)
+        
+        C1_sqrt = sqrtm(C1)
+        term2 = torch.trace(C1 + C2 - 2 * sqrtm(C1_sqrt @ C2 @ C1_sqrt))
+        return term1 + term2
+
+    # Prepare GPU tensors for components
+    # wc, ws: (K,)
+    # mc, ms: (K, C)
+    # Cc, Cs: (K, C, C)
+    
+    # Create Cost Matrix M (K x K)
+    M = torch.zeros((K, K), device=cf.device, dtype=torch.float64)
+    
+    # Convert parameters to torch if they are numpy (from sklearn)
+    # They are numpy arrays currently from the code above
+    
+    t_mc = torch.from_numpy(mc).to(cf.device).double()
+    t_ms = torch.from_numpy(ms).to(cf.device).double()
+    t_Cc = torch.from_numpy(Cc).to(cf.device).double()
+    t_Cs = torch.from_numpy(Cs).to(cf.device).double()
+    
+    for i in range(K):
+        for j in range(K):
+            M[i, j] = gaussian_w2_dist(t_mc[i], t_Cc[i], t_ms[j], t_Cs[j])
+            
+    # Solve OT with POT (on CPU is fine for 5x5)
+    # weights need to be numpy
+    M_np = M.cpu().numpy()
+    P = ot.emd(wc, ws, M_np) # (K, K) transport plan
+    
+    # 4. Apply Map (GPU)
+    # T(x) = \sum_{i,j} \frac{P_{ij} p(i|x)}{w_i} T_{i->j}(x)
+    # where T_{i->j}(x) = m_j + A_{ij}(x - m_i)
+    # A_{ij} = C_i^{-1/2} (C_i^{1/2} C_j C_i^{1/2})^{1/2} C_i^{-1/2}
+    
+    # Precompute A_{ij} matrices
+    A_matrices = torch.zeros((K, K, channels, channels), device=cf.device, dtype=torch.float64)
+    for i in range(K):
+        Ci = t_Cc[i]
+        Ci_sqrt = sqrtm(Ci)
+        Ci_sqrt_inv = torch.inverse(Ci_sqrt)
+        
+        for j in range(K):
+            Cj = t_Cs[j]
+            # Monge map for Gaussians
+            mid = sqrtm(Ci_sqrt @ Cj @ Ci_sqrt)
+            A_ij = Ci_sqrt_inv @ mid @ Ci_sqrt_inv
+            A_matrices[i, j] = A_ij
+            
+    # Calculate membership probabilities p(i|x) for each pixel
+    # log p(x|i) = -0.5 * (x-mu_i)^T inv(Sigma_i) (x-mu_i) - 0.5 log det(Sigma_i) + const
+    
+    # cfv is (C, N), dim 0 is channels
+    x = cfv.T # (N, C)
+    N_pixels = x.shape[0]
+    
+    log_probs = torch.zeros((N_pixels, K), device=cf.device, dtype=torch.float64)
+    
+    for i in range(K):
+        mu = t_mc[i] # (C,)
+        sigma = t_Cc[i] # (C, C)
+        
+        # We can use Cholesky for stability if PD
+        try:
+            L = torch.linalg.cholesky(sigma)
+            log_det = 2 * torch.sum(torch.log(torch.diagonal(L)))
+            # Mahalanobis distance
+            # (x - mu) @ inv(sigma) @ (x-mu).T
+            # = || L^-1 (x-mu) ||^2
+            
+            centered = x - mu.unsqueeze(0) # (N, C)
+            # solve L y = centered^T  -> y = L^-1 centered^T
+            y = torch.linalg.solve_triangular(L, centered.T, upper=False) # (C, N)
+            mahalanobis = torch.sum(y**2, dim=0) # (N,)
+            
+            log_probs[:, i] = torch.log(torch.tensor(wc[i])) - 0.5 * (mahalanobis + log_det)
+            
+        except Exception as e:
+            # Fallback for numerical issues
+            # print(f"Cholesky failed for comp {i}: {e}")
+            pass
+
+    # Normalize to get posteriors p(i|x)
+    # Use log-sum-exp for stability
+    max_log = torch.max(log_probs, dim=1, keepdim=True)[0]
+    # Handle cases where all probs are -inf (shouldn't happen with valid GMM)
+    probs = torch.exp(log_probs - max_log)
+    probs = probs / (torch.sum(probs, dim=1, keepdim=True) + 1e-10) # (N, K)
+    
+    # Construct the displacement
+    # We want y = \sum_{i,j} \frac{P_{ij}}{w_i} p(i|x) (m_j + A_{ij}(x - m_i))
+    #           = \sum_i p(i|x) \sum_j \frac{P_{ij}}{w_i} (m_j + A_{ij}(x - m_i))
+    
+    y = torch.zeros_like(x)
+    
+    for i in range(K):
+        # Contribution of component i
+        # weighting: gamma_i(x) = p(i|x)
+        gamma_i = probs[:, i].unsqueeze(1) # (N, 1)
+        
+        # If gamma_i is effectively 0 for all pixels, skip
+        if torch.sum(gamma_i) < 1e-6:
+            continue
+            
+        centered_i = x - t_mc[i] # (N, C)
+        
+        # Inner sum over j
+        # term_i = \sum_j (P_{ij}/w_i) (m_j + A_{ij} centered_i)
+        #        = (\sum_j P'_{ij} m_j) + (\sum_j P'_{ij} A_{ij}) centered_i
+        
+        # P'_{ij} = P_{ij} / w_i
+        w_i = wc[i]
+        if w_i < 1e-10: continue
+        
+        P_row = torch.from_numpy(P[i]).to(cf.device).double() / w_i # (K,)
+        
+        # Weighted mean target: sum_j P'_{ij} m_j
+        mean_target_i = torch.sum(P_row.unsqueeze(1) * t_ms, dim=0) # (C,)
+        
+        # Weighted Transform: sum_j P'_{ij} A_{ij}
+        # A_matrices[i] is (K, C, C)
+        # Broadcast P_row: (K, 1, 1)
+        A_target_i = torch.sum(P_row.view(K, 1, 1) * A_matrices[i], dim=0) # (C, C)
+        
+        # Map for cluster i: m'_i + A'_i(x - m_i)
+        mapped_i = mean_target_i + (centered_i @ A_target_i.T)
+        
+        y += gamma_i * mapped_i
+        
+    pushed = y.T.view_as(cf).float() # (C, H, W) or (C, H, W)
+    res = (1-alpha) * cf.float() + alpha * pushed
+    
+    if cf.dim() == 3:
+        res = res.unsqueeze(0)
+        
+    return res.float()
 
 def sqrtm(M):
     """Compute the square root of a positive semidefinite matrix"""
