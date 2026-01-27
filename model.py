@@ -1,0 +1,105 @@
+import torch
+import torch.nn as nn
+from models.autoencoder_vgg19.vgg19_1 import vgg_normalised_conv1_1, feature_invertor_conv1_1
+from models.autoencoder_vgg19.vgg19_2 import vgg_normalised_conv2_1, feature_invertor_conv2_1
+from models.autoencoder_vgg19.vgg19_3 import vgg_normalised_conv3_1, feature_invertor_conv3_1
+from models.autoencoder_vgg19.vgg19_4 import vgg_normalised_conv4_1, feature_invertor_conv4_1
+from models.autoencoder_vgg19.vgg19_5 import vgg_normalised_conv5_1, feature_invertor_conv5_1
+from wst import gaussian_transfer
+
+class Encoder(nn.Module):
+    def __init__(self, depth):
+        super(Encoder, self).__init__()
+        assert(isinstance(depth, int) and 1 <= depth <= 5)
+        self.depth = depth
+
+        if depth == 1:
+            self.model = vgg_normalised_conv1_1.vgg_normalised_conv1_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_1/vgg_normalised_conv1_1.pth", map_location='cpu', weights_only=True))
+        elif depth == 2:
+            self.model = vgg_normalised_conv2_1.vgg_normalised_conv2_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_2/vgg_normalised_conv2_1.pth", map_location='cpu', weights_only=True))
+        elif depth == 3:
+            self.model = vgg_normalised_conv3_1.vgg_normalised_conv3_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_3/vgg_normalised_conv3_1.pth", map_location='cpu', weights_only=True))
+        elif depth == 4:
+            self.model = vgg_normalised_conv4_1.vgg_normalised_conv4_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_4/vgg_normalised_conv4_1.pth", map_location='cpu', weights_only=True))
+        elif depth == 5:
+            self.model = vgg_normalised_conv5_1.vgg_normalised_conv5_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_5/vgg_normalised_conv5_1.pth", map_location='cpu', weights_only=True))
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class Decoder(nn.Module):
+    def __init__(self, depth):
+        super(Decoder, self).__init__()
+        assert(isinstance(depth, int) and 1 <= depth <= 5)
+        self.depth = depth
+
+        if depth == 1:
+            self.model = feature_invertor_conv1_1.feature_invertor_conv1_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_1/feature_invertor_conv1_1.pth", map_location='cpu', weights_only=True))
+        elif depth == 2:
+            self.model = feature_invertor_conv2_1.feature_invertor_conv2_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_2/feature_invertor_conv2_1.pth", map_location='cpu', weights_only=True))
+        elif depth == 3:
+            self.model = feature_invertor_conv3_1.feature_invertor_conv3_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_3/feature_invertor_conv3_1.pth", map_location='cpu', weights_only=True))
+        elif depth == 4:
+            self.model = feature_invertor_conv4_1.feature_invertor_conv4_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_4/feature_invertor_conv4_1.pth", map_location='cpu', weights_only=True))
+        elif depth == 5:
+            self.model = feature_invertor_conv5_1.feature_invertor_conv5_1
+            self.model.load_state_dict(torch.load("models/autoencoder_vgg19/vgg19_5/feature_invertor_conv5_1.pth", map_location='cpu', weights_only=True))
+
+    def forward(self, x):
+        return self.model(x)
+
+def stylize(level, content, style, encoders, decoders, alpha, device):
+    with torch.no_grad():
+        content_features = encoders[level](content).squeeze(0)
+        style_features = encoders[level](style).squeeze(0)
+        
+        # Apply Gaussian Wasserstein Style Transfer
+        transformed_features = gaussian_transfer(alpha, content_features, style_features).to(device)
+        
+        return decoders[level](transformed_features)
+
+class MultiLevelStyleTransfer(nn.Module):
+    def __init__(self, alpha=0.5, device='cpu'):
+        super().__init__()
+        self.alpha = alpha
+        self.device = device
+        self.encoders = [Encoder(level).to(device) for level in range(5, 0, -1)]
+        self.decoders = [Decoder(level).to(device) for level in range(5, 0, -1)]
+
+    def forward(self, content_img, style_img):
+        current_img = content_img
+        for level, (encoder, decoder) in enumerate(zip(self.encoders, self.decoders)):
+             # The list index `level` goes 0..4 corresponding to depths 5..1
+             # `stylize` uses `encoders[level]` so we pass the correct object
+            
+            # Note: The original code used a list comprehension for encoders `[Encoder(level) for level in range(5, 0, -1)]`
+            # and passed the full list `encoders` to `stylize`.
+            # Here I will simplify: I'll just pass the current encoder/decoder.
+            
+            # Wait, looking at original code:
+            # `encoders = [Encoder(level) for level in range(5, 0, -1)]`
+            # `encoders[level]` refers to the level-th element of the list, which corresponds to depth 5-level.
+            # So if loop `for level in range(len(self.encoders))`
+            # level=0 -> depth=5
+            
+            # My simplified `stylize` above took `encoders` list. I should change it to take a single encoder/decoder pair.
+            
+            with torch.no_grad():
+                content_features = encoder(current_img).squeeze(0)
+                style_features = encoder(style_img).squeeze(0)
+                
+                transformed_features = gaussian_transfer(self.alpha, content_features, style_features).to(self.device)
+                
+                current_img = decoder(transformed_features)
+                
+        return current_img
