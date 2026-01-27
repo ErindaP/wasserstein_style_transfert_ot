@@ -36,14 +36,43 @@ def get_mean_cov(features):
     
     return mean, cov, features_v_centered, features.view(c_channels, -1).double()
 
-def wasserstein_barycenter_cov(covs, weights, max_iter=50, tol=1e-6):
+def wasserstein_barycenter_cov(covs, weights, max_iter=20, tol=1e-6):
     """
     Compute the Wasserstein Barycenter of covariances using fixed point iteration.
+    For N=2, uses the closed-form geodesic.
     
     Args:
         covs: List of (C, C) covariance matrices
         weights: List of weights summing to 1
     """
+    if len(covs) == 2:
+        # Use closed-form geodesic
+        # Sigma_t = [(1-t)I + tT] Sigma_0 [(1-t)I + tT]
+        # where T is the optimal transport map from Sigma_0 to Sigma_1
+        # and t = w_1 (assuming w_0 + w_1 = 1)
+        
+        S0 = covs[0]
+        S1 = covs[1]
+        t = weights[1]
+        
+        S0_sqrt = sqrtm(S0)
+        S0_sqrt_inv = torch.inverse(S0_sqrt)
+        
+        # Transport Map T_{0->1}
+        # T = S0^{-1/2} (S0^{1/2} S1 S0^{1/2})^{1/2} S0^{-1/2}
+        
+        middle = sqrtm(S0_sqrt @ S1 @ S0_sqrt)
+        T = S0_sqrt_inv @ middle @ S0_sqrt_inv
+        
+        # Interpolation Map T_t = (1-t)I + tT
+        eye = torch.eye(S0.size(0), device=S0.device, dtype=S0.dtype)
+        Tt = (1-t) * eye + t * T
+        
+        # Sigma_t = T_t S0 T_t
+        sigma = Tt @ S0 @ Tt
+        
+        return sigma
+
     # Initial guess: simple weighted sum (Fréchet mean likely close)
     sigma = torch.zeros_like(covs[0])
     for i, C in enumerate(covs):
@@ -51,48 +80,9 @@ def wasserstein_barycenter_cov(covs, weights, max_iter=50, tol=1e-6):
         
     for k in range(max_iter):
         sigma_sqrt = sqrtm(sigma)
-        sigma_prev = sigma.clone()
         
-        T_sum = torch.zeros_like(sigma)
-        for i, C in enumerate(covs):
-            # (Sigma^1/2 * C * Sigma^1/2)^1/2
-            term = sqrtm(sigma_sqrt @ C @ sigma_sqrt)
-            T_sum += weights[i] * term
-            
-        sigma = T_sum @ T_sum # The actual iteration is Sigma_{k+1} = (Sum w_i (Sigma_k^1/2 C_i Sigma_k^1/2)^1/2)^2 ?? 
-        # Actually the fixed point is Sigma = Sum w_i (Sigma^1/2 C_i Sigma^1/2)^1/2
-        # No, wait.
-        # The equation is Sigma = \sum w_i (Sigma^{1/2} C_i Sigma^{1/2})^{1/2}  is WRONG.
-        # The equation for barycenter Sigma is: Sigma = \sum w_i (Sigma^{1/2} C_i Sigma^{1/2})^{1/2}  is effectively what many papers say but let's double check.
-        # Alvarez-Esteban et al. "A fixed-point approach to Barycenters in Wasserstein space":
-        # S_{n+1} = S_n^{-1/2} ( \sum w_i (S_n^{1/2} C_i S_n^{1/2})^{1/2} )^2 S_n^{-1/2}
-        
-        # Let's try the implementation from POT or similar if in doubt, but the standard fixed point is:
-        # T = \sum w_i (Sigma^{1/2} C_i Sigma^{1/2})^{1/2}
-        # S_{new} = S^{-1/2} T^2 S^{-1/2} ? No.
-        
-        # Actually, let's look at the paper provided if possible, but 1905.12828 is about WST, maybe not barycenters specifically.
-        # However, it mentions optimal transport.
-        
-        # Standard Fixed Point Algorithm:
-        # S = I (Identity)
-        # S = (\sum w_i (S^{1/2} C_i S^{1/2})^{1/2})^2
-        # This assumes we want barycenter.
-        
-        # Let's use the one from POT library if available or stick to the one above which is:
-        # S = ( \sum w_i (S^{1/2} C_i S^{1/2})^{1/2} )^2  <-- This assumes commuting? No.
-        
-        # Correct Fixed Point (Alvarez-Esteban 2016):
+        # Fixed Point Iteration (Alvarez-Esteban et al. 2016)
         # S_{k+1} = S_k^{-1/2} [ \sum_j w_j (S_k^{1/2} \Sigma_j S_k^{1/2})^{1/2} ]^2 S_k^{-1/2}
-        
-        # wait, let's verify if `sigma` is invertible. For style features often regularization is needed.
-        
-        # Simplified update if we assume S^{1/2} commutes (it doesn't usually).
-        
-        # Use simple iterative update:
-        # S = (\sum \dots)^2?
-        
-        # Let's implement the Alvarez-Esteban one.
         
         sigma_sqrt_inv = torch.inverse(sigma_sqrt)
         
