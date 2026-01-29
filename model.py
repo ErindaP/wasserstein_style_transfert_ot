@@ -5,7 +5,7 @@ from models.autoencoder_vgg19.vgg19_2 import vgg_normalised_conv2_1, feature_inv
 from models.autoencoder_vgg19.vgg19_3 import vgg_normalised_conv3_1, feature_invertor_conv3_1
 from models.autoencoder_vgg19.vgg19_4 import vgg_normalised_conv4_1, feature_invertor_conv4_1
 from models.autoencoder_vgg19.vgg19_5 import vgg_normalised_conv5_1, feature_invertor_conv5_1
-from wst import gaussian_transfer, gmm_transfer
+from wst import gaussian_transfer, gmm_transfer, sinkhorn_transfer, true_sinkhorn_transfer, ot_emd_transfer
 
 class Encoder(nn.Module):
     def __init__(self, depth):
@@ -69,12 +69,14 @@ def stylize(level, content, style, encoders, decoders, alpha, device):
         return decoders[level](transformed_features)
 
 class MultiLevelStyleTransfer(nn.Module):
-    def __init__(self, alpha=0.5, style_weights=None, method='gaussian', K=5, device='cpu'):
+    def __init__(self, alpha=0.5, style_weights=None, method='gaussian', K=5, epsilon=0.05, max_samples=10000, device='cpu'):
         super().__init__()
         self.alpha = alpha
         self.style_weights = style_weights
         self.method = method
         self.K = K
+        self.epsilon = epsilon
+        self.max_samples = max_samples
         self.device = device
         self.encoders = [Encoder(level).to(device) for level in range(5, 0, -1)]
         self.decoders = [Decoder(level).to(device) for level in range(5, 0, -1)]
@@ -82,20 +84,6 @@ class MultiLevelStyleTransfer(nn.Module):
     def forward(self, content_img, style_img):
         current_img = content_img
         for level, (encoder, decoder) in enumerate(zip(self.encoders, self.decoders)):
-             # The list index `level` goes 0..4 corresponding to depths 5..1
-             # `stylize` uses `encoders[level]` so we pass the correct object
-            
-            # Note: The original code used a list comprehension for encoders `[Encoder(level) for level in range(5, 0, -1)]`
-            # and passed the full list `encoders` to `stylize`.
-            # Here I will simplify: I'll just pass the current encoder/decoder.
-            
-            # Wait, looking at original code:
-            # `encoders = [Encoder(level) for level in range(5, 0, -1)]`
-            # `encoders[level]` refers to the level-th element of the list, which corresponds to depth 5-level.
-            # So if loop `for level in range(len(self.encoders))`
-            # level=0 -> depth=5
-            
-            # My simplified `stylize` above took `encoders` list. I should change it to take a single encoder/decoder pair.
             
             with torch.no_grad():
                 content_features = encoder(current_img).squeeze(0)
@@ -108,6 +96,8 @@ class MultiLevelStyleTransfer(nn.Module):
                 
                 if self.method == 'gmm':
                     transformed_features = gmm_transfer(self.alpha, content_features, style_features, style_weights=self.style_weights, K=self.K).to(self.device)
+                elif self.method == 'ot_emd':
+                    transformed_features = ot_emd_transfer(self.alpha, content_features, style_features, style_weights=self.style_weights, max_samples=self.max_samples).to(self.device)
                 else:
                     transformed_features = gaussian_transfer(self.alpha, content_features, style_features, style_weights=self.style_weights).to(self.device)
                 

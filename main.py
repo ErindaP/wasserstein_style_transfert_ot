@@ -13,8 +13,9 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.5, help="Style transfer intensity (0-1)")
     parser.add_argument("--style_weights", type=float, nargs='+', help="Weights for each style image (must sum to 1)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
-    parser.add_argument("--method", type=str, default="gaussian", choices=["gaussian", "gmm"], help="Feature transform method")
+    parser.add_argument("--method", type=str, default="gaussian", choices=["gaussian", "gmm", "ot_emd"], help="Feature transform method")
     parser.add_argument("--K", type=int, default=5, help="Number of GMM components (default: 5)")
+    parser.add_argument("--max_samples", type=int, default=10000, help="Max samples for OT emd style (default: 10000)")
     
     args = parser.parse_args()
     
@@ -46,7 +47,7 @@ def main():
     print(f"Style Weights: {weights}")
     
     # Initialize model
-    model = MultiLevelStyleTransfer(alpha=args.alpha, style_weights=weights, method=args.method, K=args.K, device=args.device)
+    model = MultiLevelStyleTransfer(alpha=args.alpha, style_weights=weights, method=args.method, K=args.K, epsilon=args.epsilon, max_samples=args.max_samples, device=args.device)
     
     # Run style transfer
     start = time.time()

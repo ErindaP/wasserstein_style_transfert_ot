@@ -4,6 +4,129 @@ import ot
 import ot.gmm
 import sklearn.mixture
 
+
+def ot_emd_transfer(alpha, cf, styles, style_weights=None, max_samples=10000):
+    """
+    Exact OT using Linear Programming (ot.emd).
+    Uses subsampling + Nearest Neighbor extension for large images.
+    """
+    if cf.dim() == 3: cf = cf.unsqueeze(0)
+    B, C, H, W = cf.shape
+    N = B * H * W
+    
+    cf_view = cf.view(B, C, -1)
+    cf_flat = cf_view.permute(0, 2, 1).reshape(-1, C).double() # (N, C)
+    
+    if isinstance(styles, torch.Tensor): styles = [styles]
+    if style_weights is None: style_weights = [1.0/len(styles)] * len(styles)
+    
+    y_list = []
+    for i, sf in enumerate(styles):
+        if sf.dim() == 3: sf = sf.unsqueeze(0)
+        sf_flat = sf.view(sf.size(0), C, -1).permute(0, 2, 1).reshape(-1, C).double()
+        
+        # Subsample style right away if needed per style (heuristic)
+        # But we'll handle global subsampling below.
+        y_list.append(sf_flat)
+        
+
+    Y_list = []
+    target_samples = min(N, max_samples)
+    
+    for i, sf_flat in enumerate(y_list):
+        n_s = sf_flat.size(0)
+        n_needed = int(style_weights[i] * target_samples)
+        if n_needed > 0:
+            if n_s > n_needed:
+                idx = torch.randperm(n_s, device=cf.device)[:n_needed]
+                Y_list.append(sf_flat[idx])
+            else:
+                Y_list.append(sf_flat) 
+    
+    if not Y_list: return cf
+    Y = torch.cat(Y_list, dim=0) # (M, C)
+    M = Y.size(0)
+    
+    # 3. Subsample Content
+    if N > max_samples:
+        indices = torch.randperm(N, device=cf.device)[:max_samples]
+        X_sampled = cf_flat[indices] # (K, C)
+    else:
+        indices = torch.arange(N, device=cf.device)
+        X_sampled = cf_flat
+        
+    K_samp = X_sampled.size(0)
+    
+    #  Compute OT 
+    # Move to CPU for POT
+    Xs_np = X_sampled.cpu().numpy()
+    Ys_np = Y.cpu().numpy()
+    
+    # Uniform weights
+    a = np.ones((K_samp,)) / K_samp
+    b = np.ones((M,)) / M
+    
+
+    # Cost Matrix
+    M_cost = ot.dist(Xs_np, Ys_np, metric='euclidean') # (K, M)
+    
+    # Solve
+    # P is (K, M) sparse matrix
+    P = ot.emd(a, b, M_cost)
+    
+
+    
+    Targets_np = (P @ Ys_np) * K_samp
+    Targets = torch.from_numpy(Targets_np).to(cf.device)
+    
+    Displacement = Targets - X_sampled # (K, C)
+    
+    # Apply to Full Content
+    # If N == K_samp, we just apply directly.
+    # If N > K_samp, we perform Nearest Neighbor interpolation of the Displacement field.
+    
+    if N == K_samp:
+
+        # Actually easier: calculate result tensor
+        res_flat = cf_flat.clone()
+        res_flat[indices] = Targets
+    else:
+        # NN Extension
+        # For every pixel in N, find closest pixel in X_sampled.
+        # Calculate distances
+        
+        # We need to assign a displacement to every pixel `cf_flat[i]`.
+        # Find nearest `X_sampled[j]`.
+        # displacement[i] = Displacement[j]
+        
+        # X_sampled is (K, C). cf_flat is (N, C).
+        
+        NN_BATCH = 4096
+        res_flat = torch.zeros_like(cf_flat)
+        
+        X_sampled_float = X_sampled.float()
+        
+        for i in range(0, N, NN_BATCH):
+            end = min(i + NN_BATCH, N)
+            batch_x = cf_flat[i:end].float()
+            
+            # Distance to samples
+            dists = torch.cdist(batch_x, X_sampled_float) # (batch, K)
+            
+            # Align
+            nearest_idx = torch.argmin(dists, dim=1) # (batch,)
+            
+            batch_disp = Displacement[nearest_idx]
+            
+            res_flat[i:end] = batch_x.double() + batch_disp
+            
+    # Reshape and Interpolate
+    res_flat = res_flat.float()
+    pushed = res_flat.view(B, H, W, C).permute(0, 3, 1, 2)
+    
+    res = (1-alpha) * cf.float() + alpha * pushed
+    return res
+
 def gmm_transfer(alpha, cf, styles, style_weights=None, K=5):
     """
     Apply GMM-based Wasserstein Style Transfer.
@@ -28,8 +151,6 @@ def gmm_transfer(alpha, cf, styles, style_weights=None, K=5):
     cfv = cf.view(channels, -1) # C x N
     
     # Subsampling for GMM fitting to improve speed
-    # Fitting on 262k points (512x512) is very slow. 
-    # We can estimate parameters from a subset.
     MAX_SAMPLES = 25000
     
     def fit_gmm(features, n_components):
@@ -94,9 +215,7 @@ def gmm_transfer(alpha, cf, styles, style_weights=None, K=5):
     
     # 3. Compute OT Plan between GMM components
     # Calculate Cost Matrix (Wasserstein distance between Gaussians)
-    import ot # Ensure ot is available
     
-    # helper for W2 distance between two Gaussians
     def gaussian_w2_dist(m1, C1, m2, C2):
         # m: (D,), C: (D, D)
         # W2^2 = ||m1-m2||^2 + Tr(C1 + C2 - 2(C1^1/2 C2 C1^1/2)^1/2)
@@ -108,15 +227,11 @@ def gmm_transfer(alpha, cf, styles, style_weights=None, K=5):
         return term1 + term2
 
     # Prepare GPU tensors for components
-    # wc, ws: (K,)
-    # mc, ms: (K, C)
-    # Cc, Cs: (K, C, C)
+
     
     # Create Cost Matrix M (K x K)
     M = torch.zeros((K, K), device=cf.device, dtype=torch.float64)
     
-    # Convert parameters to torch if they are numpy (from sklearn)
-    # They are numpy arrays currently from the code above
     
     t_mc = torch.from_numpy(mc).to(cf.device).double()
     t_ms = torch.from_numpy(ms).to(cf.device).double()
@@ -127,7 +242,7 @@ def gmm_transfer(alpha, cf, styles, style_weights=None, K=5):
         for j in range(K):
             M[i, j] = gaussian_w2_dist(t_mc[i], t_Cc[i], t_ms[j], t_Cs[j])
             
-    # Solve OT with POT (on CPU is fine for 5x5)
+    # Solve OT with POT 
     # weights need to be numpy
     M_np = M.cpu().numpy()
     P = ot.emd(wc, ws, M_np) # (K, K) transport plan
@@ -164,7 +279,6 @@ def gmm_transfer(alpha, cf, styles, style_weights=None, K=5):
         mu = t_mc[i] # (C,)
         sigma = t_Cc[i] # (C, C)
         
-        # We can use Cholesky for stability if PD
         try:
             L = torch.linalg.cholesky(sigma)
             log_det = 2 * torch.sum(torch.log(torch.diagonal(L)))
@@ -180,8 +294,7 @@ def gmm_transfer(alpha, cf, styles, style_weights=None, K=5):
             log_probs[:, i] = torch.log(torch.tensor(wc[i])) - 0.5 * (mahalanobis + log_det)
             
         except Exception as e:
-            # Fallback for numerical issues
-            # print(f"Cholesky failed for comp {i}: {e}")
+
             pass
 
     # Normalize to get posteriors p(i|x)
@@ -245,7 +358,6 @@ def sqrtm(M):
     # but arguably we should ensure symmetry before SVD if needed.
     # For now, sticking to previous implementation logic.
     _, s, v = M.svd()
-    # truncate small components
     above_cutoff = s > s.max() * s.size(-1) * torch.finfo(s.dtype).eps
     s = s[..., above_cutoff]
     v = v[..., above_cutoff]
