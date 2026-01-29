@@ -8,30 +8,51 @@ import time
 def main():
     parser = argparse.ArgumentParser(description="Wasserstein Style Transfer (Gaussian)")
     parser.add_argument("content", type=str, help="Path to content image")
-    parser.add_argument("style", type=str, help="Path to style image")
+    parser.add_argument("styles", nargs='+', type=str, help="Path to style image(s)")
     parser.add_argument("--out", type=str, default="output.jpg", help="Output path")
     parser.add_argument("--alpha", type=float, default=0.5, help="Style transfer intensity (0-1)")
+    parser.add_argument("--style_weights", type=float, nargs='+', help="Weights for each style image (must sum to 1)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
+    parser.add_argument("--method", type=str, default="gaussian", choices=["gaussian", "gmm", "ot_emd"], help="Feature transform method")
+    parser.add_argument("--K", type=int, default=5, help="Number of GMM components (default: 5)")
+    parser.add_argument("--max_samples", type=int, default=10000, help="Max samples for OT emd style (default: 10000)")
     
     args = parser.parse_args()
     
     print(f"Device: {args.device}")
+    print(f"Method: {args.method} (K={args.K})")
     
-    # Load images
-    # We don't resize by default, assuming user provides images of compatible size or VGG handles it.
-    # But VGG usually works better if images are similar size.
+    # Load content
     content = load_image(args.content).to(args.device)
-    style = load_image(args.style).to(args.device)
-    
     print(f"Content size: {content.shape}")
-    print(f"Style size: {style.shape}")
+    
+    # Load styles
+    styles = []
+    for s_path in args.styles:
+        s_img = load_image(s_path).to(args.device)
+        styles.append(s_img)
+        print(f"Loaded style: {s_path} {s_img.shape}")
+        
+    # Process weights
+    if args.style_weights:
+        if len(args.style_weights) != len(styles):
+            print("Error: Number of weights must match number of style images.")
+            return
+        # Normalize weights
+        total_weight = sum(args.style_weights)
+        weights = [w / total_weight for w in args.style_weights]
+    else:
+        weights = [1.0 / len(styles)] * len(styles)
+    
+    print(f"Style Weights: {weights}")
     
     # Initialize model
-    model = MultiLevelStyleTransfer(alpha=args.alpha, device=args.device)
+    model = MultiLevelStyleTransfer(alpha=args.alpha, style_weights=weights, method=args.method, K=args.K, epsilon=args.epsilon, max_samples=args.max_samples, device=args.device)
     
     # Run style transfer
     start = time.time()
-    result = model(content, style)
+    # Pass list of styles
+    result = model(content, styles)
     end = time.time()
     
     print(f"Time: {end - start:.2f}s")
