@@ -69,13 +69,12 @@ def stylize(level, content, style, encoders, decoders, alpha, device):
         return decoders[level](transformed_features)
 
 class MultiLevelStyleTransfer(nn.Module):
-    def __init__(self, alpha=0.5, style_weights=None, method='gaussian', K=5, epsilon=0.05, max_samples=10000, device='cpu'):
+    def __init__(self, alpha=0.5, style_weights=None, method='gaussian', K=5, max_samples=10000, device='cpu'):
         super().__init__()
         self.alpha = alpha
         self.style_weights = style_weights
         self.method = method
         self.K = K
-        self.epsilon = epsilon
         self.max_samples = max_samples
         self.device = device
         self.encoders = [Encoder(level).to(device) for level in range(5, 0, -1)]

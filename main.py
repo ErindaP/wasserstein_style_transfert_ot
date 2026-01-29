@@ -47,7 +47,7 @@ def main():
     print(f"Style Weights: {weights}")
     
     # Initialize model
-    model = MultiLevelStyleTransfer(alpha=args.alpha, style_weights=weights, method=args.method, K=args.K, epsilon=args.epsilon, max_samples=args.max_samples, device=args.device)
+    model = MultiLevelStyleTransfer(alpha=args.alpha, style_weights=weights, method=args.method, K=args.K, max_samples=args.max_samples, device=args.device)
     
     # Run style transfer
     start = time.time()
