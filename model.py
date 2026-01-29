@@ -5,7 +5,7 @@ from models.autoencoder_vgg19.vgg19_2 import vgg_normalised_conv2_1, feature_inv
 from models.autoencoder_vgg19.vgg19_3 import vgg_normalised_conv3_1, feature_invertor_conv3_1
 from models.autoencoder_vgg19.vgg19_4 import vgg_normalised_conv4_1, feature_invertor_conv4_1
 from models.autoencoder_vgg19.vgg19_5 import vgg_normalised_conv5_1, feature_invertor_conv5_1
-from wst import gaussian_transfer, gmm_transfer, sinkhorn_transfer, true_sinkhorn_transfer, ot_emd_transfer
+from wst import gaussian_transfer, gmm_transfer, sinkhorn_transfer, ot_emd_transfer
 
 class Encoder(nn.Module):
     def __init__(self, depth):
